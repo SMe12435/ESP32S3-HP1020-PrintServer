@@ -118,7 +118,7 @@ esp_err_t cloud_client_download_page(const char *job_id, int page_num,
                                       uint8_t **out_buf, size_t *out_len)
 {
     char url[384];
-    snprintf(url, sizeof(url), "%s/api/jobs/%s/page/%d.pbm",
+    snprintf(url, sizeof(url), "%s/api/jobs/%s/page/%d.zjs",
              s_cloud.server_url, job_id, page_num);
 
     /* Replace wss:// with https:// for HTTP requests */

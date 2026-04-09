@@ -17,7 +17,8 @@ from flask_sock import Sock
 from flask_login import LoginManager, login_user, login_required, UserMixin, current_user
 from dotenv import load_dotenv
 
-from renderer import render_pdf_to_pbm, render_image_to_pbm, render_text_to_pbm
+from renderer import (render_pdf_to_pbm, render_image_to_pbm, render_text_to_pbm,
+                      convert_pbm_to_zjs)
 
 load_dotenv()
 
@@ -117,6 +118,8 @@ def api_print():
 
     for i, pbm in enumerate(pages):
         (job_dir / f"page_{i}.pbm").write_bytes(pbm)
+        zjs = convert_pbm_to_zjs(pbm, dpi=settings["dpi"], paper=settings["paper"])
+        (job_dir / f"page_{i}.zjs").write_bytes(zjs)
 
     job = {
         "id": job_id,
@@ -145,6 +148,18 @@ def api_get_page(job_id, page_num):
     if not path.exists():
         abort(404)
     return send_file(path, mimetype="image/x-portable-bitmap")
+
+
+@app.route("/api/jobs/<job_id>/page/<int:page_num>.zjs")
+def api_get_page_zjs(job_id, page_num):
+    auth = request.headers.get("Authorization", "")
+    if not auth.endswith(DEVICE_API_KEY):
+        abort(403)
+
+    path = JOBS_DIR / job_id / f"page_{page_num}.zjs"
+    if not path.exists():
+        abort(404)
+    return send_file(path, mimetype="application/octet-stream")
 
 
 @app.route("/api/status")

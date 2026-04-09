@@ -1,10 +1,10 @@
 """
-Document-to-PBM renderer.
-Converts PDF, images, and text files to 1-bit PBM at a given DPI.
+Document renderer — converts PDF, images, and text to 1-bit PBM,
+then to ZjStream (HP LaserJet 1020 native format) via foo2zjs.
 """
 
 import io
-import struct
+import subprocess
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -91,9 +91,7 @@ def _image_to_pbm(img: Image.Image, paper: str, dpi: int) -> bytes:
     bw = canvas.point(lambda x: 0 if x < 128 else 255, "1")
 
     buf = io.BytesIO()
-    header = f"P4\n{target_w} {target_h}\n".encode()
-    buf.write(header)
-    buf.write(bw.tobytes())
+    bw.save(buf, format="PPM")
     return buf.getvalue()
 
 
@@ -105,6 +103,28 @@ def _paper_size_pt(paper: str) -> tuple[float, float]:
 def _paper_size_px(paper: str, dpi: int) -> tuple[int, int]:
     pt_w, pt_h = _paper_size_pt(paper)
     return int(pt_w * dpi / 72), int(pt_h * dpi / 72)
+
+
+def convert_pbm_to_zjs(pbm_bytes: bytes, dpi: int = 600,
+                       paper: str = "letter") -> bytes:
+    """Convert PBM P4 to ZjStream for HP LaserJet 1020 using foo2zjs."""
+    header_end = pbm_bytes.index(b'\n', 3)
+    dims = pbm_bytes[3:header_end].decode('ascii').split()
+    width, height = int(dims[0]), int(dims[1])
+
+    paper_code = {"letter": 1, "a4": 9, "legal": 26}.get(paper.lower(), 1)
+
+    result = subprocess.run(
+        ['foo2zjs',
+         '-r', f'{dpi}x{dpi}',
+         '-g', f'{width}x{height}',
+         '-p', str(paper_code),
+         '-z', '1'],
+        input=pbm_bytes, capture_output=True, timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"foo2zjs failed: {result.stderr.decode()}")
+    return result.stdout
 
 
 def _parse_page_range(spec: str, total: int) -> list[int]:

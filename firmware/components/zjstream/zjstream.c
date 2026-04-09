@@ -54,6 +54,7 @@ typedef struct {
 typedef struct {
     uint32_t size;
     uint32_t item;
+    uint32_t type;      /* 0 = ZJIT_UINT32 */
     uint32_t value;
 } zj_item_t;
 #pragma pack(pop)
@@ -96,6 +97,7 @@ static zj_item_t make_item(uint32_t id, uint32_t val)
     zj_item_t it = {
         .size  = le32(sizeof(zj_item_t)),
         .item  = le32(id),
+        .type  = le32(0),   /* ZJIT_UINT32 */
         .value = le32(val),
     };
     return it;
