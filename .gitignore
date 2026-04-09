@@ -1,0 +1,26 @@
+# PlatformIO
+firmware/.pio/
+firmware/.vscode/
+firmware/managed_components/
+firmware/dependencies.lock
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/sdkconfig.esp32-s3-devkitc-1
+
+# Proprietary firmware blob (download via foo2zjs: ./getweb 1020)
+firmware/data/sihp1020.dl
+
+# Python
+server/__pycache__/
+server/*.pyc
+server/.env
+server/jobs/
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.idea/
+.vscode/

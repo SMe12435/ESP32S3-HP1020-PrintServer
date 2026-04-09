@@ -1,0 +1,27 @@
+menu "Print Server Configuration"
+
+config WIFI_SSID
+    string "WiFi SSID"
+    default "YourNetwork"
+    help
+        SSID of the WiFi network to connect to.
+
+config WIFI_PASS
+    string "WiFi Password"
+    default "YourPassword"
+    help
+        Password for the WiFi network.
+
+config CLOUD_URL
+    string "Cloud Server URL"
+    default "wss://print.example.com"
+    help
+        WebSocket URL of the AWS print server.
+
+config CLOUD_API_KEY
+    string "Device API Key"
+    default "change-me-to-a-random-key"
+    help
+        API key for authenticating with the cloud server.
+
+endmenu
