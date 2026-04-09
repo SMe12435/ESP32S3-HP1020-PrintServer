@@ -7,11 +7,13 @@ import os
 import uuid
 import json
 import shutil
+import threading
 from pathlib import Path
 from datetime import datetime
 
 from flask import Flask, render_template, request, jsonify, send_file, abort
 from flask_socketio import SocketIO, emit
+from flask_sock import Sock
 from flask_login import LoginManager, login_user, login_required, UserMixin, current_user
 from dotenv import load_dotenv
 
@@ -30,13 +32,15 @@ DEVICE_API_KEY = os.getenv("DEVICE_API_KEY", "change-me")
 WEB_PASSWORD = os.getenv("WEB_PASSWORD", "admin")
 
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+sock = Sock(app)
 
 login_manager = LoginManager(app)
 login_manager.login_view = "login_page"
 
 jobs_db: dict[str, dict] = {}
 printer_status: dict = {"state": 0, "wifi": False}
-printer_sid: str | None = None
+printer_ws = None
+printer_ws_lock = threading.Lock()
 
 
 # ──── Auth ────
@@ -169,46 +173,50 @@ def api_complete_job(job_id):
     return jsonify({"ok": True})
 
 
-# ──── WebSocket: ESP32 printer connection ────
+# ──── Raw WebSocket: ESP32 printer connection ────
 
-@socketio.on("connect", namespace="/ws/printer")
-def printer_connect():
-    global printer_sid
+@sock.route("/ws/printer")
+def printer_ws_endpoint(ws):
+    global printer_ws, printer_status
+
     key = request.args.get("key", "")
     if key != DEVICE_API_KEY:
-        return False
-    printer_sid = request.sid
-    app.logger.info("ESP32 printer connected: %s", request.sid)
-
-
-@socketio.on("disconnect", namespace="/ws/printer")
-def printer_disconnect():
-    global printer_sid
-    if request.sid == printer_sid:
-        printer_sid = None
-    app.logger.info("ESP32 printer disconnected")
-
-
-@socketio.on("message", namespace="/ws/printer")
-def printer_message(data):
-    global printer_status
-    try:
-        msg = json.loads(data) if isinstance(data, str) else data
-    except (json.JSONDecodeError, TypeError):
+        ws.close(1008, "Unauthorized")
         return
 
-    msg_type = msg.get("type")
+    with printer_ws_lock:
+        printer_ws = ws
+    app.logger.info("ESP32 printer connected (raw WebSocket)")
 
-    if msg_type == "printer_status":
-        printer_status = {"state": msg.get("state", 0), "wifi": msg.get("wifi", False)}
-        socketio.emit("printer_status", printer_status, namespace="/ui")
+    try:
+        while True:
+            raw = ws.receive(timeout=60)
+            if raw is None:
+                break
+            try:
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
 
-    elif msg_type == "status":
-        job_id = msg.get("job_id")
-        if job_id in jobs_db:
-            jobs_db[job_id]["status"] = msg.get("status", "unknown")
-            jobs_db[job_id]["progress"] = msg.get("page", 0)
-            socketio.emit("job_update", jobs_db[job_id], namespace="/ui")
+            msg_type = msg.get("type")
+
+            if msg_type == "printer_status":
+                printer_status = {"state": msg.get("state", 0), "wifi": msg.get("wifi", False)}
+                socketio.emit("printer_status", printer_status, namespace="/ui")
+
+            elif msg_type == "status":
+                job_id = msg.get("job_id")
+                if job_id in jobs_db:
+                    jobs_db[job_id]["status"] = msg.get("status", "unknown")
+                    jobs_db[job_id]["progress"] = msg.get("page", 0)
+                    socketio.emit("job_update", jobs_db[job_id], namespace="/ui")
+    except Exception as e:
+        app.logger.warning("ESP32 WebSocket error: %s", e)
+    finally:
+        with printer_ws_lock:
+            if printer_ws is ws:
+                printer_ws = None
+        app.logger.info("ESP32 printer disconnected")
 
 
 # ──── WebSocket: Browser UI ────
@@ -220,14 +228,19 @@ def ui_connect():
 
 
 def _notify_printer(job_id: str, pages: int):
-    """Push a new-job notification to the ESP32 via WebSocket."""
-    if printer_sid:
-        socketio.emit("message", json.dumps({
-            "type": "new_job",
-            "job_id": job_id,
-            "pages": pages,
-        }), namespace="/ws/printer", to=printer_sid)
-        app.logger.info("Notified printer of job %s (%d pages)", job_id, pages)
+    """Push a new-job notification to the ESP32 via raw WebSocket."""
+    with printer_ws_lock:
+        ws = printer_ws
+    if ws:
+        try:
+            ws.send(json.dumps({
+                "type": "new_job",
+                "job_id": job_id,
+                "pages": pages,
+            }))
+            app.logger.info("Notified printer of job %s (%d pages)", job_id, pages)
+        except Exception as e:
+            app.logger.warning("Failed to notify printer: %s", e)
     else:
         app.logger.warning("No printer connected, job %s queued", job_id)
 
