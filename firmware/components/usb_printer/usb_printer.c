@@ -209,6 +209,8 @@ alloc_fail:
     ESP_LOGE(TAG, "transfer alloc failed");
     usb_host_interface_release(s_ctx->client_hdl, s_ctx->dev_hdl, s_ctx->intf_num);
     usb_host_device_close(s_ctx->client_hdl, s_ctx->dev_hdl);
+    s_ctx->dev_hdl = NULL;
+    set_state(PRINTER_STATE_ERROR);
 }
 
 static void handle_device_gone(void)
@@ -393,6 +395,7 @@ esp_err_t usb_printer_send_data(const uint8_t *data, size_t len, uint32_t timeou
         if (err != ESP_OK) return err;
 
         if (xSemaphoreTake(s_ctx->xfer_done_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+            set_state(PRINTER_STATE_ERROR);
             return ESP_ERR_TIMEOUT;
         }
 

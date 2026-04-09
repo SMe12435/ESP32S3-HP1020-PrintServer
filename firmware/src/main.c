@@ -93,6 +93,9 @@ static void on_wifi(bool connected, void *ctx)
             .cb_ctx = NULL,
         };
         cloud_client_init(&ccfg);
+    } else {
+        ESP_LOGW(TAG, "WiFi disconnected, tearing down cloud client");
+        cloud_client_deinit();
     }
 }
 

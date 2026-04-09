@@ -17,23 +17,25 @@ def render_pdf_to_pbm(pdf_bytes: bytes, dpi: int = 600,
                       paper: str = "letter") -> list[bytes]:
     """Render a PDF to a list of PBM P4 binary pages."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages_to_render = _parse_page_range(page_range, len(doc))
+    try:
+        pages_to_render = _parse_page_range(page_range, len(doc))
 
-    result = []
-    for pg_num in pages_to_render:
-        page = doc[pg_num]
-        mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+        result = []
+        for pg_num in pages_to_render:
+            page = doc[pg_num]
+            mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
 
-        if orientation == "landscape":
-            mat = mat.prerotate(90)
+            if orientation == "landscape":
+                mat = mat.prerotate(90)
 
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        pbm = _image_to_pbm(img, paper, dpi)
-        result.append(pbm)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            pbm = _image_to_pbm(img, paper, dpi)
+            result.append(pbm)
 
-    doc.close()
-    return result
+        return result
+    finally:
+        doc.close()
 
 
 def render_image_to_pbm(image_bytes: bytes, dpi: int = 600,
@@ -106,11 +108,22 @@ def _paper_size_px(paper: str, dpi: int) -> tuple[int, int]:
 
 
 def convert_pbm_to_zjs(pbm_bytes: bytes, dpi: int = 600,
-                       paper: str = "letter") -> bytes:
-    """Convert PBM P4 to ZjStream for HP LaserJet 1020 using foo2zjs."""
-    header_end = pbm_bytes.index(b'\n', 3)
-    dims = pbm_bytes[3:header_end].decode('ascii').split()
-    width, height = int(dims[0]), int(dims[1])
+                       paper: str = "letter",
+                       media_type: int = 1) -> bytes:
+    """Convert PBM P4 to ZjStream for HP LaserJet 1020 using foo2zjs.
+
+    media_type: 1 = Normal, 2 = Transparency, 3 = Glossy
+    """
+    try:
+        header_end = pbm_bytes.index(b'\n', 3)
+        dims = pbm_bytes[3:header_end].decode('ascii').split()
+        if len(dims) < 2:
+            raise ValueError("PBM header missing width/height")
+        width, height = int(dims[0]), int(dims[1])
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Invalid PBM dimensions: {width}x{height}")
+    except (ValueError, IndexError) as e:
+        raise RuntimeError(f"Malformed PBM header: {e}") from e
 
     paper_code = {"letter": 1, "a4": 9, "legal": 26}.get(paper.lower(), 1)
 
@@ -119,6 +132,7 @@ def convert_pbm_to_zjs(pbm_bytes: bytes, dpi: int = 600,
          '-r', f'{dpi}x{dpi}',
          '-g', f'{width}x{height}',
          '-p', str(paper_code),
+         '-m', str(media_type),
          '-z', '1'],
         input=pbm_bytes, capture_output=True, timeout=120,
     )

@@ -27,14 +27,18 @@ static void process_job(const cloud_job_t *job)
         return;
     }
 
+    uint32_t failed_pages = 0;
+
     for (uint32_t pg = 0; pg < job->total_pages; pg++) {
         cloud_client_report_status(job->job_id, "printing", pg + 1, job->total_pages);
 
         uint8_t *zjs_data = NULL;
         size_t zjs_len = 0;
         esp_err_t err = cloud_client_download_page(job->job_id, pg, &zjs_data, &zjs_len);
-        if (err != ESP_OK || !zjs_data) {
+        if (err != ESP_OK || !zjs_data || zjs_len == 0) {
             ESP_LOGE(TAG, "page %lu download failed", (unsigned long)pg);
+            if (zjs_data) free(zjs_data);
+            failed_pages++;
             continue;
         }
 
@@ -54,8 +58,15 @@ static void process_job(const cloud_job_t *job)
         ESP_LOGI(TAG, "page %lu done", (unsigned long)(pg + 1));
     }
 
-    cloud_client_complete_job(job->job_id);
-    ESP_LOGI(TAG, "job %s completed", job->job_id);
+    if (failed_pages > 0) {
+        ESP_LOGE(TAG, "job %s finished with %lu failed pages",
+                 job->job_id, (unsigned long)failed_pages);
+        cloud_client_report_status(job->job_id, "error",
+                                   job->total_pages - failed_pages, job->total_pages);
+    } else {
+        cloud_client_complete_job(job->job_id);
+        ESP_LOGI(TAG, "job %s completed", job->job_id);
+    }
 }
 
 static void printer_task(void *arg)

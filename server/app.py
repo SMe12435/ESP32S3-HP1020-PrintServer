@@ -84,13 +84,17 @@ def api_print():
     if not f or not f.filename:
         return jsonify({"error": "No file"}), 400
 
-    settings = {
-        "copies": int(request.form.get("copies", 1)),
-        "page_range": request.form.get("page_range", "all"),
-        "orientation": request.form.get("orientation", "portrait"),
-        "paper": request.form.get("paper", "letter"),
-        "dpi": int(request.form.get("dpi", 600)),
-    }
+    try:
+        settings = {
+            "copies": int(request.form.get("copies", 1)),
+            "page_range": request.form.get("page_range", "all"),
+            "orientation": request.form.get("orientation", "portrait"),
+            "paper": request.form.get("paper", "letter"),
+            "dpi": int(request.form.get("dpi", 600)),
+            "media_type": int(request.form.get("media_type", 1)),
+        }
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": f"Invalid setting: {e}"}), 400
 
     file_bytes = f.read()
     ext = Path(f.filename).suffix.lower()
@@ -116,10 +120,16 @@ def api_print():
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir()
 
-    for i, pbm in enumerate(pages):
-        (job_dir / f"page_{i}.pbm").write_bytes(pbm)
-        zjs = convert_pbm_to_zjs(pbm, dpi=settings["dpi"], paper=settings["paper"])
-        (job_dir / f"page_{i}.zjs").write_bytes(zjs)
+    try:
+        for i, pbm in enumerate(pages):
+            (job_dir / f"page_{i}.pbm").write_bytes(pbm)
+            zjs = convert_pbm_to_zjs(pbm, dpi=settings["dpi"],
+                                     paper=settings["paper"],
+                                     media_type=settings["media_type"])
+            (job_dir / f"page_{i}.zjs").write_bytes(zjs)
+    except Exception as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify({"error": f"Conversion failed: {e}"}), 500
 
     job = {
         "id": job_id,
@@ -203,6 +213,18 @@ def printer_ws_endpoint(ws):
         printer_ws = ws
     app.logger.info("ESP32 printer connected (raw WebSocket)")
 
+    for jid, j in list(jobs_db.items()):
+        if j.get("status") == "queued":
+            try:
+                ws.send(json.dumps({
+                    "type": "new_job",
+                    "job_id": jid,
+                    "pages": j.get("rendered_pages", 0),
+                }))
+                app.logger.info("Replayed queued job %s to printer", jid)
+            except Exception:
+                break
+
     try:
         while True:
             raw = ws.receive(timeout=60)
@@ -231,6 +253,8 @@ def printer_ws_endpoint(ws):
         with printer_ws_lock:
             if printer_ws is ws:
                 printer_ws = None
+        printer_status = {"state": 0, "wifi": False}
+        socketio.emit("printer_status", printer_status, namespace="/ui")
         app.logger.info("ESP32 printer disconnected")
 
 

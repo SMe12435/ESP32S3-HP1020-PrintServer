@@ -101,6 +101,7 @@ document.addEventListener("DOMContentLoaded", () => {
     form.append("page_range", document.getElementById("page-range").value);
     form.append("paper", document.getElementById("paper").value);
     form.append("orientation", document.getElementById("orientation").value);
+    form.append("media_type", document.getElementById("media-type").value);
     form.append("dpi", document.getElementById("dpi").value);
 
     try {

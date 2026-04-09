@@ -12,7 +12,9 @@ static const char *TAG = "wifi_mgr";
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
-#define MAX_RETRY          10
+
+static const uint32_t BACKOFF_MS[] = { 1000, 2000, 5000, 10000, 30000, 60000 };
+#define BACKOFF_STEPS (sizeof(BACKOFF_MS) / sizeof(BACKOFF_MS[0]))
 
 static EventGroupHandle_t s_wifi_events;
 static int s_retry_count = 0;
@@ -28,14 +30,13 @@ static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *da
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_connected = false;
         if (s_on_connect) s_on_connect(false, s_cb_ctx);
-        if (s_retry_count < MAX_RETRY) {
-            esp_wifi_connect();
-            s_retry_count++;
-            ESP_LOGI(TAG, "reconnecting (%d/%d)", s_retry_count, MAX_RETRY);
-        } else {
-            xEventGroupSetBits(s_wifi_events, WIFI_FAIL_BIT);
-            ESP_LOGW(TAG, "connection failed after %d retries", MAX_RETRY);
-        }
+
+        uint32_t idx = s_retry_count < (int)BACKOFF_STEPS ? s_retry_count : BACKOFF_STEPS - 1;
+        uint32_t delay = BACKOFF_MS[idx];
+        s_retry_count++;
+        ESP_LOGW(TAG, "disconnected, retry #%d in %lu ms", s_retry_count, (unsigned long)delay);
+        vTaskDelay(pdMS_TO_TICKS(delay));
+        esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "connected, ip=" IPSTR, IP2STR(&event->ip_info.ip));
@@ -89,15 +90,15 @@ esp_err_t wifi_manager_init(const wifi_manager_config_t *cfg)
     ESP_LOGI(TAG, "connecting to %s", cfg->ssid);
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_events,
-                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                            WIFI_CONNECTED_BIT,
                                             pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
 
     if (bits & WIFI_CONNECTED_BIT) {
         return ESP_OK;
     }
 
-    ESP_LOGW(TAG, "STA connect timed out, falling back to AP");
-    return wifi_manager_start_ap("PrintServer_Setup", "12345678");
+    ESP_LOGW(TAG, "initial STA connect timed out, retries continue in background");
+    return ESP_OK;
 }
 
 bool wifi_manager_is_connected(void)

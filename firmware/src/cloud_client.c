@@ -1,4 +1,5 @@
 #include "cloud_client.h"
+#include "usb_printer.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_websocket_client.h"
@@ -9,6 +10,7 @@
 #include "freertos/task.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 static const char *TAG = "cloud";
 
@@ -26,10 +28,17 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
     esp_websocket_event_data_t *ev = (esp_websocket_event_data_t *)data;
 
     switch (id) {
-    case WEBSOCKET_EVENT_CONNECTED:
+    case WEBSOCKET_EVENT_CONNECTED: {
         ESP_LOGI(TAG, "WebSocket connected");
         s_cloud.connected = true;
+        char status_buf[128];
+        snprintf(status_buf, sizeof(status_buf),
+                 "{\"type\":\"printer_status\",\"state\":%d,\"wifi\":true}",
+                 (int)usb_printer_get_state());
+        esp_websocket_client_send_text(s_cloud.ws, status_buf, strlen(status_buf),
+                                        pdMS_TO_TICKS(2000));
         break;
+    }
 
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "WebSocket disconnected");
@@ -77,6 +86,14 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
 
 esp_err_t cloud_client_init(const cloud_client_config_t *cfg)
 {
+    if (s_cloud.ws) {
+        ESP_LOGW(TAG, "cloud client already running, tearing down first");
+        esp_websocket_client_stop(s_cloud.ws);
+        esp_websocket_client_destroy(s_cloud.ws);
+        s_cloud.ws = NULL;
+        s_cloud.connected = false;
+    }
+
     memset(&s_cloud, 0, sizeof(s_cloud));
     strncpy(s_cloud.server_url, cfg->server_url, sizeof(s_cloud.server_url) - 1);
     strncpy(s_cloud.api_key, cfg->api_key, sizeof(s_cloud.api_key) - 1);
@@ -176,6 +193,13 @@ esp_err_t cloud_client_download_page(const char *job_id, int page_num,
     if (status != 200 && status != 0) {
         free(buf);
         ESP_LOGE(TAG, "page download HTTP %d", status);
+        return ESP_FAIL;
+    }
+
+    if (content_length != 5 * 1024 * 1024 && total_read != content_length) {
+        ESP_LOGW(TAG, "page %d incomplete: got %d of %d bytes",
+                 page_num, total_read, content_length);
+        free(buf);
         return ESP_FAIL;
     }
 
