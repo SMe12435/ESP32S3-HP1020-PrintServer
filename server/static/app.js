@@ -20,7 +20,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // ── Detect login state by trying /api/status ──
   fetch("/api/status").then(r => {
-    if (r.ok) { showMain(); } else { showLogin(); }
+    if (r.ok && !r.redirected) { showMain(); } else { showLogin(); }
   }).catch(() => showLogin());
 
   function showLogin() {
