@@ -19,5 +19,5 @@ RUN mkdir -p /app/jobs
 
 EXPOSE 5000
 
-CMD ["gunicorn", "--worker-class", "geventwebsocket.gunicorn.workers.GeventWebSocketWorker", \
+CMD ["gunicorn", "--worker-class", "gevent", \
      "-w", "1", "-b", "0.0.0.0:5000", "--timeout", "120", "app:app"]
