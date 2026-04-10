@@ -125,15 +125,6 @@ void app_main(void)
     };
     wifi_manager_init(&wcfg);
 
-    /* Main loop: periodic status reporting */
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
-
-        printer_state_t ps = usb_printer_get_state();
-        char status_buf[128];
-        snprintf(status_buf, sizeof(status_buf),
-                 "{\"type\":\"printer_status\",\"state\":%d,\"wifi\":%s}",
-                 ps, wifi_manager_is_connected() ? "true" : "false");
-        cloud_client_send_printer_status(status_buf);
-    }
+    /* Nothing left to do — polling task handles everything */
+    vTaskDelete(NULL);
 }

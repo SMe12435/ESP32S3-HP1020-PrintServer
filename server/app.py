@@ -1,19 +1,18 @@
 """
 Cloud print server — receives documents via web UI, renders to PBM,
-delivers to ESP32 printer bridge over WebSocket + HTTPS.
+delivers to ESP32 printer bridge via HTTP polling.
 """
 
 import os
 import uuid
 import json
 import shutil
-import threading
+import time
 from pathlib import Path
 from datetime import datetime
 
 from flask import Flask, render_template, request, jsonify, send_file, abort
 from flask_socketio import SocketIO, emit
-from flask_sock import Sock
 from flask_login import LoginManager, login_user, login_required, UserMixin, current_user
 from dotenv import load_dotenv
 
@@ -33,15 +32,13 @@ DEVICE_API_KEY = os.getenv("DEVICE_API_KEY", "change-me")
 WEB_PASSWORD = os.getenv("WEB_PASSWORD", "admin")
 
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
-sock = Sock(app)
 
 login_manager = LoginManager(app)
 login_manager.login_view = "login_page"
 
 jobs_db: dict[str, dict] = {}
 printer_status: dict = {"state": 0, "wifi": False}
-printer_ws = None
-printer_ws_lock = threading.Lock()
+last_device_seen: float = 0.0
 
 
 # ──── Auth ────
@@ -54,6 +51,12 @@ THE_USER = User()
 @login_manager.user_loader
 def load_user(uid):
     return THE_USER if uid == "admin" else None
+
+
+def _check_device_key():
+    auth = request.headers.get("Authorization", "")
+    if not auth.endswith(DEVICE_API_KEY):
+        abort(403)
 
 
 # ──── Web routes ────
@@ -143,17 +146,14 @@ def api_print():
     }
     jobs_db[job_id] = job
 
-    _notify_printer(job_id, len(pages))
+    app.logger.info("Job %s queued (%d pages), ESP32 will pick up on next poll", job_id, total_pages)
 
     return jsonify({"job_id": job_id, "pages": total_pages})
 
 
 @app.route("/api/jobs/<job_id>/page/<int:page_num>.pbm")
 def api_get_page(job_id, page_num):
-    auth = request.headers.get("Authorization", "")
-    if not auth.endswith(DEVICE_API_KEY):
-        abort(403)
-
+    _check_device_key()
     path = JOBS_DIR / job_id / f"page_{page_num}.pbm"
     if not path.exists():
         abort(404)
@@ -162,10 +162,7 @@ def api_get_page(job_id, page_num):
 
 @app.route("/api/jobs/<job_id>/page/<int:page_num>.zjs")
 def api_get_page_zjs(job_id, page_num):
-    auth = request.headers.get("Authorization", "")
-    if not auth.endswith(DEVICE_API_KEY):
-        abort(403)
-
+    _check_device_key()
     path = JOBS_DIR / job_id / f"page_{page_num}.zjs"
     if not path.exists():
         abort(404)
@@ -175,17 +172,17 @@ def api_get_page_zjs(job_id, page_num):
 @app.route("/api/status")
 @login_required
 def api_status():
+    online = (time.time() - last_device_seen) < 30
+    effective_status = printer_status if online else {"state": 0, "wifi": False}
     return jsonify({
-        "printer": printer_status,
+        "printer": effective_status,
         "jobs": list(jobs_db.values())[-20:],
     })
 
 
 @app.route("/api/jobs/<job_id>/complete", methods=["POST"])
 def api_complete_job(job_id):
-    auth = request.headers.get("Authorization", "")
-    if not auth.endswith(DEVICE_API_KEY):
-        abort(403)
+    _check_device_key()
 
     if job_id in jobs_db:
         jobs_db[job_id]["status"] = "completed"
@@ -198,90 +195,60 @@ def api_complete_job(job_id):
     return jsonify({"ok": True})
 
 
-# ──── Raw WebSocket: ESP32 printer connection ────
+# ──── Device polling API (replaces WebSocket) ────
 
-@sock.route("/ws/printer")
-def printer_ws_endpoint(ws):
-    global printer_ws, printer_status
+@app.route("/api/poll")
+def api_poll():
+    """ESP32 calls this every ~10s to pick up queued jobs."""
+    _check_device_key()
 
-    key = request.args.get("key", "")
-    if key != DEVICE_API_KEY:
-        ws.close(1008, "Unauthorized")
-        return
+    global last_device_seen
+    last_device_seen = time.time()
 
-    with printer_ws_lock:
-        printer_ws = ws
-    app.logger.info("ESP32 printer connected (raw WebSocket)")
-
+    queued = []
     for jid, j in list(jobs_db.items()):
         if j.get("status") == "queued":
-            try:
-                ws.send(json.dumps({
-                    "type": "new_job",
-                    "job_id": jid,
-                    "pages": j.get("rendered_pages", 0),
-                }))
-                app.logger.info("Replayed queued job %s to printer", jid)
-            except Exception:
-                break
+            queued.append({"job_id": jid, "pages": j.get("rendered_pages", 0)})
 
-    try:
-        while True:
-            raw = ws.receive(timeout=60)
-            if raw is None:
-                break
-            try:
-                msg = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                continue
+    return jsonify({"jobs": queued})
 
-            msg_type = msg.get("type")
 
-            if msg_type == "printer_status":
-                printer_status = {"state": msg.get("state", 0), "wifi": msg.get("wifi", False)}
-                socketio.emit("printer_status", printer_status, namespace="/ui")
+@app.route("/api/device/status", methods=["POST"])
+def api_device_status():
+    """ESP32 posts printer state and/or job progress."""
+    _check_device_key()
 
-            elif msg_type == "status":
-                job_id = msg.get("job_id")
-                if job_id in jobs_db:
-                    jobs_db[job_id]["status"] = msg.get("status", "unknown")
-                    jobs_db[job_id]["progress"] = msg.get("page", 0)
-                    socketio.emit("job_update", jobs_db[job_id], namespace="/ui")
-    except Exception as e:
-        app.logger.warning("ESP32 WebSocket error: %s", e)
-    finally:
-        with printer_ws_lock:
-            if printer_ws is ws:
-                printer_ws = None
-        printer_status = {"state": 0, "wifi": False}
+    global printer_status, last_device_seen
+    last_device_seen = time.time()
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "No JSON body"}), 400
+
+    msg_type = data.get("type")
+
+    if msg_type == "printer_status":
+        printer_status = {"state": data.get("state", 0), "wifi": data.get("wifi", False)}
         socketio.emit("printer_status", printer_status, namespace="/ui")
-        app.logger.info("ESP32 printer disconnected")
+
+    elif msg_type == "job_status":
+        job_id = data.get("job_id")
+        if job_id and job_id in jobs_db:
+            jobs_db[job_id]["status"] = data.get("status", "unknown")
+            jobs_db[job_id]["progress"] = data.get("page", 0)
+            socketio.emit("job_update", jobs_db[job_id], namespace="/ui")
+
+    return jsonify({"ok": True})
 
 
-# ──── WebSocket: Browser UI ────
+# ──── Socket.IO: Browser UI ────
 
 @socketio.on("connect", namespace="/ui")
 def ui_connect():
-    emit("printer_status", printer_status)
+    online = (time.time() - last_device_seen) < 30
+    effective_status = printer_status if online else {"state": 0, "wifi": False}
+    emit("printer_status", effective_status)
     emit("jobs_list", list(jobs_db.values())[-20:])
-
-
-def _notify_printer(job_id: str, pages: int):
-    """Push a new-job notification to the ESP32 via raw WebSocket."""
-    with printer_ws_lock:
-        ws = printer_ws
-    if ws:
-        try:
-            ws.send(json.dumps({
-                "type": "new_job",
-                "job_id": job_id,
-                "pages": pages,
-            }))
-            app.logger.info("Notified printer of job %s (%d pages)", job_id, pages)
-        except Exception as e:
-            app.logger.warning("Failed to notify printer: %s", e)
-    else:
-        app.logger.warning("No printer connected, job %s queued", job_id)
 
 
 # ──── Entry point ────

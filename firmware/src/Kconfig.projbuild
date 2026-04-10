@@ -14,9 +14,9 @@ config WIFI_PASS
 
 config CLOUD_URL
     string "Cloud Server URL"
-    default "wss://print.example.com"
+    default "http://print.example.com:5000"
     help
-        WebSocket URL of the AWS print server.
+        HTTP URL of the print server (e.g. http://65.2.99.92:5000).
 
 config CLOUD_API_KEY
     string "Device API Key"

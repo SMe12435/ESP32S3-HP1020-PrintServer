@@ -1,8 +1,8 @@
 #include "cloud_client.h"
 #include "usb_printer.h"
+#include "wifi_manager.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
-#include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
 #include "esp_heap_caps.h"
@@ -14,84 +14,176 @@
 
 static const char *TAG = "cloud";
 
+#define POLL_INTERVAL_MS  10000
+#define POLL_TASK_STACK   8192
+#define POLL_TASK_PRIO    4
+#define HTTP_BUF_SIZE     2048
+
 static struct {
-    esp_websocket_client_handle_t ws;
     char server_url[256];
     char api_key[128];
     cloud_job_cb_t on_new_job;
     void *cb_ctx;
-    bool connected;
+    TaskHandle_t poll_task;
+    bool running;
 } s_cloud;
 
-static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+
+static esp_err_t http_post_json(const char *path, const char *json_body)
 {
-    esp_websocket_event_data_t *ev = (esp_websocket_event_data_t *)data;
+    char url[384];
+    snprintf(url, sizeof(url), "%s%s", s_cloud.server_url, path);
 
-    switch (id) {
-    case WEBSOCKET_EVENT_CONNECTED: {
-        ESP_LOGI(TAG, "WebSocket connected");
-        s_cloud.connected = true;
-        char status_buf[128];
-        snprintf(status_buf, sizeof(status_buf),
-                 "{\"type\":\"printer_status\",\"state\":%d,\"wifi\":true}",
-                 (int)usb_printer_get_state());
-        esp_websocket_client_send_text(s_cloud.ws, status_buf, strlen(status_buf),
-                                        pdMS_TO_TICKS(2000));
-        break;
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .timeout_ms = 10000,
+        .buffer_size = 1024,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) return ESP_FAIL;
+
+    char auth_hdr[160];
+    snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", s_cloud.api_key);
+    esp_http_client_set_header(client, "Authorization", auth_hdr);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_post_field(client, json_body, strlen(json_body));
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "POST %s failed: %s", path, esp_err_to_name(err));
+        return err;
     }
-
-    case WEBSOCKET_EVENT_DISCONNECTED:
-        ESP_LOGW(TAG, "WebSocket disconnected");
-        s_cloud.connected = false;
-        break;
-
-    case WEBSOCKET_EVENT_DATA:
-        if (ev->op_code == 0x01 && ev->data_len > 0) {
-            char *json_str = strndup((const char *)ev->data_ptr, ev->data_len);
-            if (!json_str) break;
-
-            cJSON *root = cJSON_Parse(json_str);
-            free(json_str);
-            if (!root) break;
-
-            cJSON *type = cJSON_GetObjectItem(root, "type");
-            if (type && cJSON_IsString(type) && strcmp(type->valuestring, "new_job") == 0) {
-                cloud_job_t job = {};
-                cJSON *jid = cJSON_GetObjectItem(root, "job_id");
-                cJSON *pages = cJSON_GetObjectItem(root, "pages");
-                if (jid && cJSON_IsString(jid)) {
-                    strncpy(job.job_id, jid->valuestring, CLOUD_MAX_JOB_ID_LEN - 1);
-                }
-                if (pages && cJSON_IsNumber(pages)) {
-                    job.total_pages = (uint32_t)pages->valuedouble;
-                }
-                ESP_LOGI(TAG, "new job: %s (%lu pages)",
-                         job.job_id, (unsigned long)job.total_pages);
-                if (s_cloud.on_new_job) {
-                    s_cloud.on_new_job(&job, s_cloud.cb_ctx);
-                }
-            }
-            cJSON_Delete(root);
-        }
-        break;
-
-    case WEBSOCKET_EVENT_ERROR:
-        ESP_LOGE(TAG, "WebSocket error");
-        break;
-
-    default:
-        break;
+    if (status != 200) {
+        ESP_LOGW(TAG, "POST %s returned %d", path, status);
+        return ESP_FAIL;
     }
+    return ESP_OK;
 }
+
+
+static void send_printer_status(void)
+{
+    char body[128];
+    snprintf(body, sizeof(body),
+             "{\"type\":\"printer_status\",\"state\":%d,\"wifi\":%s}",
+             (int)usb_printer_get_state(),
+             wifi_manager_is_connected() ? "true" : "false");
+    http_post_json("/api/device/status", body);
+}
+
+
+static void poll_for_jobs(void)
+{
+    char url[384];
+    snprintf(url, sizeof(url), "%s/api/poll", s_cloud.server_url);
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .timeout_ms = 10000,
+        .buffer_size = HTTP_BUF_SIZE,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) return;
+
+    char auth_hdr[160];
+    snprintf(auth_hdr, sizeof(auth_hdr), "Bearer %s", s_cloud.api_key);
+    esp_http_client_set_header(client, "Authorization", auth_hdr);
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        esp_http_client_cleanup(client);
+        return;
+    }
+
+    int content_length = esp_http_client_fetch_headers(client);
+    if (content_length <= 0) content_length = HTTP_BUF_SIZE;
+    if (content_length > HTTP_BUF_SIZE) content_length = HTTP_BUF_SIZE;
+
+    char *buf = malloc(content_length + 1);
+    if (!buf) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return;
+    }
+
+    int total_read = 0;
+    while (total_read < content_length) {
+        int rd = esp_http_client_read(client, buf + total_read, content_length - total_read);
+        if (rd <= 0) break;
+        total_read += rd;
+    }
+    buf[total_read] = '\0';
+
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (status != 200 || total_read == 0) {
+        free(buf);
+        return;
+    }
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) return;
+
+    cJSON *jobs = cJSON_GetObjectItem(root, "jobs");
+    if (jobs && cJSON_IsArray(jobs)) {
+        int count = cJSON_GetArraySize(jobs);
+        for (int i = 0; i < count; i++) {
+            cJSON *entry = cJSON_GetArrayItem(jobs, i);
+            if (!entry) continue;
+
+            cJSON *jid = cJSON_GetObjectItem(entry, "job_id");
+            cJSON *pages = cJSON_GetObjectItem(entry, "pages");
+
+            cloud_job_t job = {};
+            if (jid && cJSON_IsString(jid)) {
+                strncpy(job.job_id, jid->valuestring, CLOUD_MAX_JOB_ID_LEN - 1);
+            }
+            if (pages && cJSON_IsNumber(pages)) {
+                job.total_pages = (uint32_t)pages->valuedouble;
+            }
+
+            ESP_LOGI(TAG, "polled job: %s (%lu pages)",
+                     job.job_id, (unsigned long)job.total_pages);
+
+            if (s_cloud.on_new_job) {
+                s_cloud.on_new_job(&job, s_cloud.cb_ctx);
+            }
+        }
+    }
+
+    cJSON_Delete(root);
+}
+
+
+static void poll_task(void *arg)
+{
+    ESP_LOGI(TAG, "poll task started (every %d ms)", POLL_INTERVAL_MS);
+
+    while (s_cloud.running) {
+        if (wifi_manager_is_connected()) {
+            send_printer_status();
+            poll_for_jobs();
+        }
+        vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
+    }
+
+    ESP_LOGI(TAG, "poll task stopped");
+    vTaskDelete(NULL);
+}
+
 
 esp_err_t cloud_client_init(const cloud_client_config_t *cfg)
 {
-    if (s_cloud.ws) {
-        ESP_LOGW(TAG, "cloud client already running, tearing down first");
-        esp_websocket_client_stop(s_cloud.ws);
-        esp_websocket_client_destroy(s_cloud.ws);
-        s_cloud.ws = NULL;
-        s_cloud.connected = false;
+    if (s_cloud.poll_task) {
+        ESP_LOGW(TAG, "cloud client already running, stopping first");
+        cloud_client_deinit();
     }
 
     memset(&s_cloud, 0, sizeof(s_cloud));
@@ -99,37 +191,21 @@ esp_err_t cloud_client_init(const cloud_client_config_t *cfg)
     strncpy(s_cloud.api_key, cfg->api_key, sizeof(s_cloud.api_key) - 1);
     s_cloud.on_new_job = cfg->on_new_job;
     s_cloud.cb_ctx = cfg->cb_ctx;
+    s_cloud.running = true;
 
-    char ws_url[320];
-    snprintf(ws_url, sizeof(ws_url), "%s/ws/printer?key=%s",
-             cfg->server_url, cfg->api_key);
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        poll_task, "cloud_poll", POLL_TASK_STACK,
+        NULL, POLL_TASK_PRIO, &s_cloud.poll_task, 0);
 
-    esp_websocket_client_config_t ws_cfg = {
-        .uri = ws_url,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .reconnect_timeout_ms = 5000,
-        .network_timeout_ms = 10000,
-        .buffer_size = 4096,
-    };
-
-    s_cloud.ws = esp_websocket_client_init(&ws_cfg);
-    if (!s_cloud.ws) {
-        ESP_LOGE(TAG, "ws init failed");
+    if (ret != pdTRUE) {
+        ESP_LOGE(TAG, "failed to create poll task");
         return ESP_FAIL;
     }
 
-    esp_websocket_register_events(s_cloud.ws, WEBSOCKET_EVENT_ANY,
-                                   ws_event_handler, NULL);
-
-    esp_err_t err = esp_websocket_client_start(s_cloud.ws);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ws start failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    ESP_LOGI(TAG, "cloud client started -> %s", cfg->server_url);
+    ESP_LOGI(TAG, "cloud client started -> %s (HTTP polling)", cfg->server_url);
     return ESP_OK;
 }
+
 
 esp_err_t cloud_client_download_page(const char *job_id, int page_num,
                                       uint8_t **out_buf, size_t *out_len)
@@ -138,18 +214,8 @@ esp_err_t cloud_client_download_page(const char *job_id, int page_num,
     snprintf(url, sizeof(url), "%s/api/jobs/%s/page/%d.zjs",
              s_cloud.server_url, job_id, page_num);
 
-    /* Replace wss:// with https:// for HTTP requests */
-    if (strncmp(url, "wss://", 6) == 0) {
-        memmove(url + 8, url + 6, strlen(url + 6) + 1);
-        memcpy(url, "https://", 8);
-    } else if (strncmp(url, "ws://", 5) == 0) {
-        memmove(url + 7, url + 5, strlen(url + 5) + 1);
-        memcpy(url, "http://", 7);
-    }
-
     esp_http_client_config_t http_cfg = {
         .url = url,
-        .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 30000,
         .buffer_size = 8192,
     };
@@ -209,13 +275,12 @@ esp_err_t cloud_client_download_page(const char *job_id, int page_num,
     return ESP_OK;
 }
 
+
 esp_err_t cloud_client_report_status(const char *job_id, const char *status,
                                       int page_done, int page_total)
 {
-    if (!s_cloud.connected) return ESP_ERR_INVALID_STATE;
-
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "type", "status");
+    cJSON_AddStringToObject(root, "type", "job_status");
     cJSON_AddStringToObject(root, "job_id", job_id);
     cJSON_AddStringToObject(root, "status", status);
     cJSON_AddNumberToObject(root, "page", page_done);
@@ -224,31 +289,26 @@ esp_err_t cloud_client_report_status(const char *job_id, const char *status,
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
 
+    esp_err_t err = ESP_FAIL;
     if (json) {
-        esp_websocket_client_send_text(s_cloud.ws, json, strlen(json), pdMS_TO_TICKS(2000));
+        err = http_post_json("/api/device/status", json);
         free(json);
     }
-    return ESP_OK;
+    return err;
 }
+
 
 esp_err_t cloud_client_complete_job(const char *job_id)
 {
     return cloud_client_report_status(job_id, "completed", 0, 0);
 }
 
-void cloud_client_send_printer_status(const char *status_json)
-{
-    if (s_cloud.connected && s_cloud.ws) {
-        esp_websocket_client_send_text(s_cloud.ws, status_json, strlen(status_json),
-                                        pdMS_TO_TICKS(1000));
-    }
-}
 
 void cloud_client_deinit(void)
 {
-    if (s_cloud.ws) {
-        esp_websocket_client_stop(s_cloud.ws);
-        esp_websocket_client_destroy(s_cloud.ws);
-        s_cloud.ws = NULL;
+    s_cloud.running = false;
+    if (s_cloud.poll_task) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        s_cloud.poll_task = NULL;
     }
 }
