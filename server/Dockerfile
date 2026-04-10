@@ -19,5 +19,5 @@ RUN mkdir -p /app/jobs
 
 EXPOSE 5000
 
-CMD ["gunicorn", "--worker-class", "gevent", \
+CMD ["gunicorn", "--worker-class", "gthread", "--threads", "4", \
      "-w", "1", "-b", "0.0.0.0:5000", "--timeout", "120", "app:app"]

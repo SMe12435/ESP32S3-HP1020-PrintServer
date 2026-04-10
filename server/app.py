@@ -32,7 +32,7 @@ JOBS_DIR.mkdir(exist_ok=True)
 DEVICE_API_KEY = os.getenv("DEVICE_API_KEY", "change-me")
 WEB_PASSWORD = os.getenv("WEB_PASSWORD", "admin")
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 sock = Sock(app)
 
 login_manager = LoginManager(app)
